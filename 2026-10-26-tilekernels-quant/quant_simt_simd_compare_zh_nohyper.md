@@ -169,17 +169,17 @@ $$
 
 (这里公式都是单个标量的数学运算，带入torch都是elementwise操作，无需考虑tensor shape)
 
-这里有 $s_f \ge s$，因为 $s_f$ 本身满足下面恒等式，不需要ceil取整:
+这里有 $s_f \ge s$ ，因为 $s_f$ 本身满足下面恒等式，不需要ceil取整:
 
 $$
 \mathrm{s_f} = 2^{\log_2 s_f} \ge 2^{\log_2 s}
 $$
 
-$s$已知，怎么算 ${\left\lceil \log_2 s \right\rceil}$ 呢？先考虑更简单的`floor-log2`: ${\left\lfloor \log_2 s \right\rfloor}$ ，用 `bits >> 23 - 127` 就能算出来。FP32的bit是`S1E8M23`, `bits >> 23`把8位指数挪到了最右边。因为是absmax, sign bit一定是0，就只剩`E8`的部分。
+$s$ 已知，怎么算 ${\left\lceil \log_2 s \right\rceil}$ 呢？先考虑更简单的`floor-log2`: ${\left\lfloor \log_2 s \right\rfloor}$ ，用 `bits >> 23 - 127` 就能算出来。FP32的bit是`S1E8M23`, `bits >> 23`把8位指数挪到了最右边。因为是absmax, sign bit一定是0，就只剩`E8`的部分。
 
 <img src="fig/fp32_format.png" alt="FP32 format" width="50%" />
 
-注意float32的`E8`存的是*biased exponent*，代表的实数是 $s = 1.M \times 2^{E - 127}$，所以`log2(s) = (E − 127) + log2(1.m)`，要把`E8`减掉`127`才是${\left\lfloor \log_2 s \right\rfloor}$。
+注意float32的`E8`存的是*biased exponent*，代表的实数是 $s = 1.M \times 2^{E - 127}$ ，所以`log2(s) = (E − 127) + log2(1.m)`，要把`E8`减掉`127`才是 ${\left\lfloor \log_2 s \right\rfloor}$ 。
 
 回忆经典的C++ ceil-division `(x - 1) / y + 1` (正数情况，对比floor-division `x / y`)。这里的ceil-log2 vs floor-log2是类似的trick，把`bits >> 23`改成`(bits - 1) >> 23) + 1`，就相当于ceil-log2了。先`-1`把“刚好不被向下舍入的数”(除法情况就是x为y的整数倍，log2情况就是2^n整次幂)变成“会被向下舍入的数”，然后把向下舍入的结果+1修回来 -- 使得“刚好整除的数/刚好是2^n的数”计算结果恰好不变，其他数值相当于被向上舍入。biased exponent`-127`的部分依旧，完整公式就是： ${\left\lceil \log_2 s \right\rceil}$ 等于 `((bits - 1) >> 23) + 1 - 127`
 
