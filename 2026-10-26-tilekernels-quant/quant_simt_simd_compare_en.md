@@ -169,17 +169,17 @@ $$
 
 (Every formula here is a scalar mathematical operation. When expressed in PyTorch, it is elementwise, so tensor shapes are irrelevant.)
 
-Here $s_f \ge s$, because $s_f$ itself satisfies the following identity without requiring ceiling:
+Here $s_f \ge s$ , because $s_f$ itself satisfies the following identity without requiring ceiling:
 
 $$
 \mathrm{s_f} = 2^{\log_2 s_f} \ge 2^{\log_2 s}
 $$
 
-Given $s$, how do we compute ${\left\lceil \log_2 s \right\rceil}$? First consider the simpler floor-log2, ${\left\lfloor \log_2 s \right\rfloor}$, which can be computed as `bits >> 23 - 127`. FP32 has the bit layout `S1E8M23`; `bits >> 23` moves the 8-bit exponent to the rightmost position. Because this is an absolute maximum, the sign bit must be zero, leaving only the `E8` portion.
+Given $s$ , how do we compute ${\left\lceil \log_2 s \right\rceil}$ ? First consider the simpler floor-log2, ${\left\lfloor \log_2 s \right\rfloor}$ , which can be computed as `bits >> 23 - 127`. FP32 has the bit layout `S1E8M23`; `bits >> 23` moves the 8-bit exponent to the rightmost position. Because this is an absolute maximum, the sign bit must be zero, leaving only the `E8` portion.
 
 <img src="fig/fp32_format.png" alt="FP32 format" width="50%" />
 
-Remember that float32's `E8` stores a *biased exponent*: the represented real number is $s = 1.M \times 2^{E - 127}$. Thus `log2(s) = (E − 127) + log2(1.m)`, and `127` must be subtracted from `E8` to obtain ${\left\lfloor \log_2 s \right\rfloor}$.
+Remember that float32's `E8` stores a *biased exponent*: the represented real number is $s = 1.M \times 2^{E - 127}$ . Thus `log2(s) = (E − 127) + log2(1.m)`, and `127` must be subtracted from `E8` to obtain ${\left\lfloor \log_2 s \right\rfloor}$ .
 
 Recall the classic C++ ceiling-division formula `(x - 1) / y + 1` for positive values, as opposed to floor division `x / y`. The ceil-log2 vs floor-log2 trick is analogous: replace `bits >> 23` with `((bits - 1) >> 23) + 1`. Subtracting one handles the boundary case. An exact multiple of `y`—or an exact power of two for log2—moves just below that boundary. Adding one after the shift restores the original result, while non-boundary values are effectively rounded upward. The biased-exponent adjustment `-127` remains, yielding the complete formula: ${\left\lceil \log_2 s \right\rceil}$ equals `((bits - 1) >> 23) + 1 - 127`.
 
