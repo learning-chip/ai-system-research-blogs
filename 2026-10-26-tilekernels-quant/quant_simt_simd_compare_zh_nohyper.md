@@ -3,28 +3,28 @@
 带超链接的原版见<sup>[1]</sup>
 
 本文正文**纯手敲，无AI生成**。AI agent仅用于示例代码仓，可复现本文结果：
-- CA model仿真单核算子VF，没有NPU卡的同学也可以跑，带Dockerfile一键复现： <sup>[2]</sup>
-- 完整多核流水+上板：<sup>[3]</sup>
+- CA model仿真单核算子VF，没有NPU卡的同学也可以跑，带Dockerfile一键复现： https://github.com/PTO-ISA/tilelang-puzzles-ascend/tree/simt_compare
+- 完整多核流水+上板：https://github.com/PTO-ISA/TileKernels-PTO
 
 参考自DeepSeek官方样例：
-- <sup>[4]</sup>
-- <sup>[5]</sup>
+- https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/README.md
+- https://github.com/deepseek-ai/TileKernels/tree/v2.1.0-release/tile_kernels/quant
 
 # 写作动机
 
-多年来，笔者一直不能理解许多人把"NPU编程困难"归咎于"不支持CUDA/SIMT"。我琢磨着，CUDA经常要写warp shuffle/vote/sync/mma不也没有SIMT的便利性了？而CPU上过去十几年手搓AVX/Neon/SVE也没人抱怨难写？"SIMD NPU"比"SIMD CPU"确实难写的地方在software pipelining，所幸TileLang原生支持了昇腾<sup>[4]</sup>，算子哥只要用`T.Pipelined`自动排软件流水，不用痛苦地手排set_flag/wait_flag和cross-core flag这堆semaphore了。(感谢DeepSeek源神！)
+多年来，笔者一直不能理解许多人把"NPU编程困难"归咎于"不支持CUDA/SIMT"。我琢磨着，CUDA经常要写warp shuffle/vote/sync/mma不也没有SIMT的便利性了？而CPU上过去十几年手搓AVX/Neon/SVE也没人抱怨难写？"SIMD NPU"比"SIMD CPU"确实难写的地方在software pipelining，所幸TileLang原生支持了昇腾<sup>[2]</sup>，算子哥只要用`T.Pipelined`自动排软件流水，不用痛苦地手排set_flag/wait_flag和cross-core flag这堆semaphore了。(感谢DeepSeek源神！)
 
-但NPU算子依然看着比CUDA复杂。根据DS开源的TileKernels样例<sup>[6]</sup>，每一个`*_asc.py`算子比相应的`*_cuda.py`冗长**约两倍**。这里不是手搓software pipelining的锅了 (已经被`T.Pipelined`, `T.Persistent`, `T.Stage`等隐藏起来)，而是由于`with T.SimdVF():`内大量使用底层SIMD指令，例如`vld`, `vsts`, `vadds`, `vdup`等等 (见`tilelang.ascend.language.simd`<sup>[7]</sup>）。GPU代码则是`T.Parallel` scope内的标量粒度操作，看着更简单。本文放下SIMD vs SIMT之争的主观偏见，基于具体算法pattern，客观分析语法gap到底在哪。
+但NPU算子依然看着比CUDA复杂。根据DS开源的TileKernels样例<sup>[3]</sup>，每一个`*_asc.py`算子比相应的`*_cuda.py`冗长**约两倍**。这里不是手搓software pipelining的锅了 (已经被`T.Pipelined`, `T.Persistent`, `T.Stage`等隐藏起来)，而是由于`with T.SimdVF():`内大量使用底层SIMD指令，例如`vld`, `vsts`, `vadds`, `vdup`等等 (见`tilelang.ascend.language.simd`<sup>[4]</sup>）。GPU代码则是`T.Parallel` scope内的标量粒度操作，看着更简单。本文放下SIMD vs SIMT之争的主观偏见，基于具体算法pattern，客观分析语法gap到底在哪。
 
 <img src="fig/hybrid_simt_simd.png" alt="hybrid_simt_simd" width="50%" />
 
-Ascend 950支持了SIMD与SIMT混合编程<sup>[8]</sup>，由上图所示。我们可以把同一个算子用SIMD和SIMT各写一遍，逐行对比。SIMT模式的编程体验和早期CUDA接近，只是性能差于SIMD（后文有实测；这里不像优化CUDA那样做好coalesce就能持平SIMD/warp，而是指令吞吐就不同），且指令种类有缺失 (e.g. FP4转换在SIMT模式没有，只在SIMD有)。在SIMD模式下，得进一步区分是"**SIMD本身**难写" (宽泛的结论) 还是"**ASC/CCE的SIMD抽象**太底层所以难写" (更谨慎的结论，说明SIMD概念模型还能抢救)
+Ascend 950支持了SIMD与SIMT混合编程<sup>[5]</sup>，由上图所示。我们可以把同一个算子用SIMD和SIMT各写一遍，逐行对比。SIMT模式的编程体验和早期CUDA接近，只是性能差于SIMD（后文有实测；这里不像优化CUDA那样做好coalesce就能持平SIMD/warp，而是指令吞吐就不同），且指令种类有缺失 (e.g. FP4转换在SIMT模式没有，只在SIMD有)。在SIMD模式下，得进一步区分是"**SIMD本身**难写" (宽泛的结论) 还是"**ASC/CCE的SIMD抽象**太底层所以难写" (更谨慎的结论，说明SIMD概念模型还能抢救)
 
 为了对tilelang社区做些贡献，PTO团队思考了两种方案：
-- 一是维持在SIMD编程范畴，但是抽象掉ASC/CCE里难写的SIMD指令，让编程体验更接近SIMD CPU，也就是PTO Virtual micro Instruction (pto.vmi)<sup>[9]</sup>。使用tilelang社区PTO后端codegen_pto.cc<sup>[10]</sup>，用户可以设置 `target='pto'` 从tilelang codegen生成PTO-DSL (类似tilelang -> CuteDSL的lowering路径，和Cute共享CodeGenTileLangPY<sup>[11]</sup>基类)，也可以直接编写或修改底层的PTO-DSL<sup>[12]</sup>。
-- 二是给用户营造更像SIMT的幻觉，允许`T.Parallel`这种标量+SIMT式的语法，把更多的困难留给编译器，见PR 3512<sup>[13]</sup> （嗅到了远古的"SIMT-to-SIMD transpilation"送命题的味道？所幸，不需要整个CUDA编译到NPU，只是Vector Function内部，相信我们优秀的编译器团队可以搞定）
+- 一是维持在SIMD编程范畴，但是抽象掉ASC/CCE里难写的SIMD指令，让编程体验更接近SIMD CPU，也就是PTO Virtual micro Instruction (pto.vmi)<sup>[6]</sup>。使用tilelang社区PTO后端codegen_pto.cc<sup>[7]</sup>，用户可以设置 `target='pto'` 从tilelang codegen生成PTO-DSL (类似tilelang -> CuteDSL的lowering路径，和Cute共享CodeGenTileLangPY<sup>[8]</sup>基类)，也可以直接编写或修改底层的PTO-DSL<sup>[9]</sup>。
+- 二是给用户营造更像SIMT的幻觉，允许`T.Parallel`这种标量+SIMT式的语法，把更多的困难留给编译器，见PR 3512<sup>[10]</sup> （嗅到了远古的"SIMT-to-SIMD transpilation"送命题的味道？所幸，不需要整个CUDA编译到NPU，只是Vector Function内部，相信我们优秀的编译器团队可以搞定）
 
-以上设计是众多同事日夜奋战的结果 (自行看tilelang git committer，不抢credit)。个人一项贡献是在今年初 (顶着反对声音，咳咳。。) 搓了一版 PTO-DSL前端原型<sup>[14]</sup>，证明不依靠厚重的bisheng/clang前端也可以用Python->MLIR搓算子，且框架层可以*做薄、透明可魔改*。该DSL后续已重构优化并合入开源的PTO Assembler<sup>[15]</sup>与9/30后的官方CANN包。
+以上设计是众多同事日夜奋战的结果 (自行看tilelang git committer，不抢credit)。个人一项贡献是在今年初 (顶着反对声音，咳咳。。) 搓了一版 PTO-DSL前端原型<sup>[11]</sup>，证明不依靠厚重的bisheng/clang前端也可以用Python->MLIR搓算子，且框架层可以*做薄、透明可魔改*。该DSL后续已重构优化并合入开源的PTO Assembler<sup>[12]</sup>与9/30后的官方CANN包。
 
 # 大纲
 
@@ -45,17 +45,17 @@ Ascend 950支持了SIMD与SIMT混合编程<sup>[8]</sup>，由上图所示。我
 <a id="why-quantize"></a>
 # 为何选量化算法为切入点
 
-原因一：国庆开源的TileKernels昇腾适配里，quant算子占很大比例<sup>[5]</sup>。这些都是真实场景有用的算子，有足够的复杂度，例如FP8 cast考虑了输出的内存排布和DeepGEMM对齐，无缝对接。性能也好，大shape性能可以打到950DT roofline的80%左右（见benchmark<sup>[16]</sup>），对950PR已经远远超标了（即HBM bound，不是vector bound）。在Semianalysis的性能实测里<sup>[17]</sup>，tilelang的quantize算子数倍快于Triton-ascend, dequant算子数倍快于CANN包内置算子。
+原因一：国庆开源的TileKernels昇腾适配里，quant算子占很大比例<sup>[13]</sup>。这些都是真实场景有用的算子，有足够的复杂度，例如FP8 cast考虑了输出的内存排布和DeepGEMM对齐，无缝对接。性能也好，大shape性能可以打到950DT roofline的80%左右（见benchmark<sup>[14]</sup>），对950PR已经远远超标了（即HBM bound，不是vector bound）。在Semianalysis的性能实测里<sup>[15]</sup>，tilelang的quantize算子数倍快于Triton-ascend, dequant算子数倍快于CANN包内置算子。
 
 ![semi_950_kernel_quant](fig/semi_950_kernel_quant.png)
 
 原因二：同类的quant算子，在ops-nn仓的AscendC的写法十分酸爽，语法有很大改良空间：
-- MXFP量化，一个核心文件1600行，还没算上其他变种模板 <sup>[18]</sup>
-- MXFP反量化，一个核心文件800行 <sup>[19]</sup>
+- MXFP量化，一个核心文件1600行，还没算上其他变种模板 https://gitcode.com/cann/ops-nn/blob/master/quant/dynamic_mx_quant/op_kernel/arch35/dynamic_mx_quant_tail_axis.h
+- MXFP反量化，一个核心文件800行 https://gitcode.com/cann/ops-nn/blob/master/quant/anti_mx_quant/op_kernel/arch35/anti_mx_quant_tail_axis.h
 
 这类算子有个有趣的特征：数学公式简单，比attention/MoE等融合算子简单得多（无非是 分组reduce_max，分组乘scale，dtype转换, 再pack一下scaling factor省内存；反量化就是顺序倒过来且不用reduce），写成pytorch不到10行，CUDA代码也不复杂 (唯一丑点的是如果手写 `__shfl_*_sync`等等，所幸tilelang把warp操作藏在`T.reduce_*` primitive里了)。写成NPU算子却过分冗长 -- 哪怕tilelang已经化简了很多复杂度，也要花100~200行捣腾SIMD寄存器；而AscendC还要手写流水和模板，自然就上千行了。
 
-Ascend 950量化逃不开的运算是 `Reg::Interleave`<sup>[20]</sup> (`S.vintlv`) 和 `Reg::Deinterleave`<sup>[21]</sup> (`S.vdintlv`)，以及相关的`Reg::LoadDist::DIST_DINTLV_B32` (`S.vld2(..., dist="DINTLV_B32"`) 等等。这是由于一个SIMD寄存器长度永远是256 Byte，无论类型(FP32/FP16/BF16/FP8)，所以type cast前后会导致寄存器**数量**的变化，而不是**长度**的变化。这就是为什么`T.vcvt`参数<sup>[22]</sup>会有`PART_EVEN`/`PART_ODD`，甚至`PART_P0`/`PART_P1`/`PART_P2`/`PART_P3`。AscendC `Reg::Cast`文档<sup>[23]</sup>有示意图：
+Ascend 950量化逃不开的运算是 `Reg::Interleave`<sup>[16]</sup> (`S.vintlv`) 和 `Reg::Deinterleave`<sup>[17]</sup> (`S.vdintlv`)，以及相关的`Reg::LoadDist::DIST_DINTLV_B32` (`S.vld2(..., dist="DINTLV_B32"`) 等等。这是由于一个SIMD寄存器长度永远是256 Byte，无论类型(FP32/FP16/BF16/FP8)，所以type cast前后会导致寄存器**数量**的变化，而不是**长度**的变化。这就是为什么`T.vcvt`参数<sup>[18]</sup>会有`PART_EVEN`/`PART_ODD`，甚至`PART_P0`/`PART_P1`/`PART_P2`/`PART_P3`。AscendC `Reg::Cast`文档<sup>[19]</sup>有示意图：
 
 <img src="fig/cast_parts.png" alt="cast_parts" width="70%" />
 
@@ -78,7 +78,7 @@ Ascend 950量化逃不开的运算是 `Reg::Interleave`<sup>[20]</sup> (`S.vintl
 
 <img src="fig/quant_dim_compare_txt.png" alt="quant algo compare text" width="70%" />
 
-（截图自论文 Pretraining large language models with MXFP4 on Native FP4 Hardware<sup>[24]</sup>）
+（截图自论文 Pretraining large language models with MXFP4 on Native FP4 Hardware<sup>[20]</sup>）
 
 TileKernels/quant还有更细节的变种：
 - scaling factor (sf) 是按`[batch, group]`存，还是转置的`[group, batch]`存 (`use_tma_aligned_col_major_sf=True`)
@@ -131,7 +131,7 @@ def torch_per_block_cast(x: torch.Tensor, block: tuple = (32, 32)):
     return q, sf
 ```
 
-(完整脚本见 puzzles/torch/quant<sup>[25]</sup>)
+(完整脚本见 puzzles/torch/quant<sup>[21]</sup>)
 
 上面省略了一些细节，这里补充:
 
@@ -141,7 +141,7 @@ def torch_per_block_cast(x: torch.Tensor, block: tuple = (32, 32)):
 
 3. 上面代码示例输出的scaling factor `sf`是高精度FP32 (E8M23)。按照MXFP8的定义，sf应该只取E8的部分，并且pack进int16或int32数组省内存(因为没有原生的"E8M0"类型数组)。对应TileKernels/quant里的`round_sf=True`和`use_packed_ue8m0=True`同时成立。
 
-`round`这一步依赖bit操作(左移右移, and/or)。真实tilelang kernel里也有**同样的位运算**，例如CUDA后端的 `get_sf_and_inv`<sup>[26]</sup>，或者Ascend后端的`compute_scale`<sup>[27]</sup>.
+`round`这一步依赖bit操作(左移右移, and/or)。真实tilelang kernel里也有**同样的位运算**，例如CUDA后端的 `get_sf_and_inv`<sup>[22]</sup>，或者Ascend后端的`compute_scale`<sup>[23]</sup>.
 
 *此处把数学部分搞清楚，后面理解算子就容易了，无非是把torch API换成等价的NPU指令。*
 
@@ -218,7 +218,7 @@ packed = lo | (hi << 8)  # 左右取or，拼起来
 <a id="patterns"></a>
 # 按运算pattern分类
 
-DS开源的TileKernels把上面提到的很多变种放进了一个kernel文件里，通过许多`config` fields在kernel内做compile-time branching。笔者从中拆出了独立的小pattern tilelang-puzzles-ascend<sup>[2]</sup>，仿照tilelang-puzzles<sup>[28]</sup>的从易到难、循序渐进风格，便于学习理解。quant类算子按复杂度和算法pattern，分成了几类：
+DS开源的TileKernels把上面提到的很多变种放进了一个kernel文件里，通过许多`config` fields在kernel内做compile-time branching。笔者从中拆出了独立的小pattern tilelang-puzzles-ascend<sup>[24]</sup>，仿照tilelang-puzzles<sup>[25]</sup>的从易到难、循序渐进风格，便于学习理解。quant类算子按复杂度和算法pattern，分成了几类：
 
 | | cast_back | per_token | per_block | per_channel |
 |---|---|---|---|---|
@@ -281,7 +281,7 @@ V.vstore(V.vcmax(V.vabs(x, mask), mask, group=groups_per_pair),
          amax_ub[group])
 ```
 
-vcmax指令<sup>[29]</sup> + `vabs` 等价于SIMT代码里reshape + `T.reduce_absmax`的效果。CA模型显示，运行这段SIMD代码比SIMT模式*少花近一半的cycle*，见后文的性能总结。
+vcmax指令<sup>[26]</sup> + `vabs` 等价于SIMT代码里reshape + `T.reduce_absmax`的效果。CA模型显示，运行这段SIMD代码比SIMT模式*少花近一半的cycle*，见后文的性能总结。
 
 ASC SIMD写法，则难读得多。这是由于前文解释的“一个SIMD物理寄存器无论type永远是256 Byte长，所以type cast会导致寄存器**数量**的变化”。由于这个限制，在AscendC代码随处可见“用2~4个寄存器表示一组数学含义相同的变量，调用2～4次重复的API”。
 
@@ -299,7 +299,7 @@ S.vsts(amax_ub[group + 3], S.vcmax(a1, mask_high),
         dist="ONEPT_B32")
 ```
 
-这个低层次的代码是PTO希望抽象掉的，就不展开解释了。有兴趣可参见更底层的Micro Instruction Spec<sup>[30]</sup>.
+这个低层次的代码是PTO希望抽象掉的，就不展开解释了。有兴趣可参见更底层的Micro Instruction Spec<sup>[27]</sup>.
 
 <a id="simt-simd-similar"></a>
 ## SIMT和SIMD区别微小的case
@@ -419,7 +419,7 @@ for i in T.Parallel(hidden):
 
 Group-Query Attention也有类似算法pattern，多个query共享一个kv，相当于要把kv broadcast才能和q乘。
 
-cast_back_cuda.py<sup>[31]</sup>泛化到二维broadcast，简单两行代码支持{1D/2D, 按行/按列}的反量化：
+cast_back_cuda.py<sup>[28]</sup>泛化到二维broadcast，简单两行代码支持{1D/2D, 按行/按列}的反量化：
 
 ```python
 for i, j in T.Parallel(TILE_M, TILE_K):
@@ -436,7 +436,7 @@ scaled = V.vmul(values, scale, mask)
 
 只要用户或agent知道这个API存在，代码也是两行。
 
-cast_back_asc.py<sup>[32]</sup>的SIMD指令冗长2倍。用户/agent需要知道`vld`有个`BRC_B32` mode，并且手动合并两个物理寄存器。
+cast_back_asc.py<sup>[29]</sup>的SIMD指令冗长2倍。用户/agent需要知道`vld`有个`BRC_B32` mode，并且手动合并两个物理寄存器。
 
 ```python
 lo = S.vld(sf_ub[group], dist="BRC_B32")
@@ -454,7 +454,7 @@ for c in T.Parallel(hidden):
     packed_ub[PACK_FACTOR * c + 1] = sf_rows_ub[1, c]
 ```
 
-相当于transpose，把"跨行的非连续sf"转成连续packing，化简自更泛化的tilelang SIMT代码 `tile_kernels/quant/common.py`的`get_sf_index`<sup>[33]</sup>：
+相当于transpose，把"跨行的非连续sf"转成连续packing，化简自更泛化的tilelang SIMT代码 `tile_kernels/quant/common.py`的`get_sf_index`<sup>[30]</sup>：
 
 ```python
     if config.sf_col_pack:
@@ -484,7 +484,7 @@ lo, _ = S.vintlv(a, b)
 S.vsts(packed_ub[col * PACK_FACTOR], lo, dist="NORM_B8")
 ```
 
-参考自 `per_channel_cast_asc.py`的`pack_sf_rows`<sup>[34]</sup>
+参考自 `per_channel_cast_asc.py`的`pack_sf_rows`<sup>[31]</sup>
 
 这个少有的"PTO SIMD并未简化ASC"的情形。SIMT确实好理解些，无需用户了解`vintlv`指令及其行为。
 
@@ -495,7 +495,7 @@ S.vsts(packed_ub[col * PACK_FACTOR], lo, dist="NORM_B8")
 
 上个case是特殊的`[2, N] -> [N, 2]` transpose，如果考虑更泛化的transpose，那么SIMD模式就不能用专门的`vintlv`了，而得用更泛化的`vgather`。在SIMT模式依然是简单的标量下标`A[j, i] = ...`
 
-当`out_config.use_tma_aligned_col_major_sf = True`，要把scaling factor transpose成 `[batch, group] -> [group, batch]`再store出去。`per_token_cast_asc.py`在`transpose_vectors()`里调用`S.vgather2`实现transpose<sup>[35]</sup>.
+当`out_config.use_tma_aligned_col_major_sf = True`，要把scaling factor transpose成 `[batch, group] -> [group, batch]`再store出去。`per_token_cast_asc.py`在`transpose_vectors()`里调用`S.vgather2`实现transpose<sup>[32]</sup>.
 
 CUDA/SIMT写法十分简单，只要改一行。不需要知道vgather指令行为，不需要构造gather index。
 
@@ -522,7 +522,7 @@ S.vsts(sf_out_ub[base, 0],
 
 ```
 
-`gather`只是一行，麻烦的是`idx`的构造。per_token_cast_asc.py内<sup>[36]</sup>根据是否packing (占FP32还是只占8位E8M0)，根据`pack_factor` (这里等于2)，构造transpose用的下标：
+`gather`只是一行，麻烦的是`idx`的构造。per_token_cast_asc.py内<sup>[33]</sup>根据是否packing (占FP32还是只占8位E8M0)，根据`pack_factor` (这里等于2)，构造transpose用的下标：
 
 ```python
     def init_transpose_indices(indices):
@@ -562,7 +562,7 @@ for i, j in T.Parallel(bm, bk):
 T.reduce_absmax(flat_l, tile_l, dim=1)
 ```
 
-完整版见per_block_cast_cuda.py<sup>[37]</sup>
+完整版见per_block_cast_cuda.py<sup>[34]</sup>
 
 ```python
 for i, j in T.Parallel(block_m, block_k):
@@ -597,7 +597,7 @@ tile_amax = V.vcmax(partials, mask_chunks, group=1)
 
 ### `per_token/04` FP4 not supported in SIMT
 
-最后是一个Ascend SIMT模式写不了的特殊情况：cast to FP4 和 cast back from FP4。GPU上有`__nv_fp4_e2m1`系列的primitive<sup>[38]</sup>, tilelang `per_token_cast_cuda.py`也支持`T.cast`到`T.float4_e2m1fn`类型；只是Ascend950 SIMT ISA里没有FP4转换指令，只能在SIMD模式下转。
+最后是一个Ascend SIMT模式写不了的特殊情况：cast to FP4 和 cast back from FP4。GPU上有`__nv_fp4_e2m1`系列的primitive<sup>[35]</sup>, tilelang `per_token_cast_cuda.py`也支持`T.cast`到`T.float4_e2m1fn`类型；只是Ascend950 SIMT ISA里没有FP4转换指令，只能在SIMD模式下转。
 
 SimtVF里对int类型进行bit操作，可以software-emulate出E2M1格式
 ```python
@@ -609,7 +609,7 @@ exps = (bits >> 23) & 0xFF
 mant = bits & 0x7FFFFF
 ```
 
-完整可运行代码见 simt/per_token/04_fp32_in_fp4_out.py<sup>[39]</sup>
+完整可运行代码见 simt/per_token/04_fp32_in_fp4_out.py<sup>[36]</sup>
 
 但性能非常慢，比原生SIMD慢90倍cycle，见下一节性能测试。只要把cast这一步写成SIMD，其他都保留SIMT，就能从慢90倍变成只慢1.26倍。
 
@@ -631,9 +631,9 @@ with T.SimdVF():
 <a id="perf-vf"></a>
 # 性能对比 (VF仿真)
 
-由于最近连不上机器了，先用CA模型跑一下Vector Function的cycle数，硬件实测下次再补。用`T.Kernel(1)` launch单核算子，不统计`T.copy` DMA的开销，不考虑GM<->UB流水、多核schedule的优化水平，纯粹看SIMD vs SIMT有区别的局部代码。使用 `msopprof simulator`，见 msOpProf Simulator Mode User Guide<sup>[40]</sup>。
+由于最近连不上机器了，先用CA模型跑一下Vector Function的cycle数，硬件实测下次再补。用`T.Kernel(1)` launch单核算子，不统计`T.copy` DMA的开销，不考虑GM<->UB流水、多核schedule的优化水平，纯粹看SIMD vs SIMT有区别的局部代码。使用 `msopprof simulator`，见 msOpProf Simulator Mode User Guide<sup>[37]</sup>。
 
-本节原始数据在quant_vf_cycles.json<sup>[41]</sup>，结果可在CPU + Docker环境复现，完全由TileLang DSL + msprof内置CA模型测出；无需手写AscendC，无需真实NPU。
+本节原始数据在quant_vf_cycles.json<sup>[38]</sup>，结果可在CPU + Docker环境复现，完全由TileLang DSL + msprof内置CA模型测出；无需手写AscendC，无需真实NPU。
 
 相同算法，相同shape，SIMT的cycle数多1.2 ~ 10倍不等。注意这只是VF仿真的结果，不代表真实硬件上的性能差距。如果VF耗时很短，算子是memory bound，那么cycle数多点少点都不会影响实测耗时。
 
@@ -643,7 +643,7 @@ with T.SimdVF():
 - SIMT相对SIMD慢3倍以上的case，例如`per_channel` & `per_block` ，通常也是SIMT语法明显比SIMD简单的case。SIMD要挑选合适的 broadcast, interleave, gather指令，而SIMT捣鼓两行下标就完事。
     - 如果编译器能自动把这些case从SIMT DSL前端映射到SIMD硬件后端 (类似于把GPU的coalescing做到软件里；或者能处理高维复杂pattern的auto-vectorization compiler)，就能既兼容GPU CUDA-like代码又发挥Ascend 950的峰值性能
 
-同样用SIMD，对比PTO vs ASC。这里基于`vmi-v0.1.9` PTOAS版本<sup>[42]</sup>，后续版本可能有更多优化。
+同样用SIMD，对比PTO vs ASC。这里基于`vmi-v0.1.9` PTOAS版本<sup>[39]</sup>，后续版本可能有更多优化。
 
 <img src="fig/pto_cycles.png" alt="FP32 format" width="60%" />
 
@@ -670,7 +670,7 @@ MXFP8->BF16反量化为例，profiling图：
 
 在Agent编程的年代，本文花大篇幅讨论"降低编程复杂度"真的重要吗？目前阶段，"代码易于人类理解 & review & 维护"依然是重要加分项，至少看不懂的代码我还不敢merge。。。虽然写算子这行当几乎被agent取代完了，但agent写完你总得读懂(~~以及背锅~~)不是？
 
-看到一篇slime v0.3.0: 面向 Agent 时代<sup>[43]</sup>讨论了"Agent 辅助的项目维护"，深以为然：
+看到一篇slime v0.3.0: 面向 Agent 时代<sup>[40]</sup>讨论了"Agent 辅助的项目维护"，深以为然：
 
     在我看来，使用 coding agent 编程主要有 2 个主要的风险，
 
@@ -680,7 +680,7 @@ MXFP8->BF16反量化为例，profiling图：
 
 还有另一个常见疑问是，`T.Parallel` -> PTO SIMD的自动转换，如果用户写出*非常访存不友好*的奇葩pattern (`x[i, j]`这种灵活标量语法可以写得放飞自我)，会不会有编译器分析搞不定的case，或者转换结果不是最优？肯定有，我可以造出arbitrarily bad meaningless test cases。。但lowering pass可以做成best-effort：如果转成功了就是免费午餐提升性能，如果无法分析可以fallback到SIMT模式运行、或报错&回到用户手写SIMD的开发方式，对用户也没有负面影响。类似`torch.compile`的设计逻辑，能处理就是赚，不能处理至少可以fallback to eager。
 
-相比于 `T.Parallel` + 标量下标的SIMT式语法，对NPU编译器更轻松的肯定是*扩展high-level SIMD API surface*：添加一堆类似torch/numpy的高维reshape/transpose/reduce/broadcast/gather/scatter等等，不需要lifting只需要lowering。借用Paul Kelly老爷子的一张图<sup>[44]</sup>，下山可比上山容易多了：
+相比于 `T.Parallel` + 标量下标的SIMT式语法，对NPU编译器更轻松的肯定是*扩展high-level SIMD API surface*：添加一堆类似torch/numpy的高维reshape/transpose/reduce/broadcast/gather/scatter等等，不需要lifting只需要lowering。借用Paul Kelly老爷子的一张图<sup>[41]</sup>，下山可比上山容易多了：
 
 <img src="fig/Helicopter.png" alt="Helicopter" width="40%" />
 
@@ -691,47 +691,44 @@ MXFP8->BF16反量化为例，profiling图：
 
 ```
 [1] quant_simt_simd_compare_zh.md
-[2] https://github.com/PTO-ISA/tilelang-puzzles-ascend/tree/simt_compare
-[3] https://github.com/PTO-ISA/TileKernels-PTO
-[4] https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/README.md
-[5] https://github.com/deepseek-ai/TileKernels/tree/v2.1.0-release/tile_kernels/quant
-[6] https://github.com/deepseek-ai/TileKernels/tree/v2.1.0-release/tile_kernels/
-[7] https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/language/simd.py
-[8] https://www.hiascend.com/document/detail/zh/canncommercial/latest/programug/Ascendcopdevg/atlas_ascendc_10_10052.html
-[9] https://github.com/PTO-ISA/PTO-Gym/blob/main/docs/PTO-vmi-Instruction-SPEC.md
-[10] https://github.com/tile-ai/tilelang/blob/main/src/ascend/codegen/codegen_pto.cc
-[11] https://github.com/tile-ai/tilelang/blob/424792eba01d887805fda8f71c847aa7749e6643/src/ascend/codegen/codegen_pto.h#L22
-[12] https://github.com/hw-native-sys/PTOAS/blob/v0.68/ptodsl/docs/user_guide/14-vmi-virtual-instruction-set.md
-[13] https://github.com/tile-ai/tilelang/pull/3512
-[14] https://github.com/huawei-csl/pto-dsl
-[15] https://github.com/hw-native-sys/PTOAS
-[16] https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/README.md#benchmark
-[17] https://newsletter.semianalysis.com/i/218361806/from-fast-kernels-to-reusable-kernel-engineering
-[18] https://gitcode.com/cann/ops-nn/blob/master/quant/dynamic_mx_quant/op_kernel/arch35/dynamic_mx_quant_tail_axis.h
-[19] https://gitcode.com/cann/ops-nn/blob/master/quant/anti_mx_quant/op_kernel/arch35/anti_mx_quant_tail_axis.h
-[20] https://gitcode.com/cann/asc-devkit/blob/v9.1.1/docs/api/SIMD-API/%E5%9F%BA%E7%A1%80API/Reg%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/MaskReg%E8%AE%A1%E7%AE%97/Interleave-11.md
-[21] https://gitcode.com/cann/asc-devkit/blob/v9.1.1/docs/api/SIMD-API/%E5%9F%BA%E7%A1%80API/Reg%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/MaskReg%E8%AE%A1%E7%AE%97/DeInterleave-12.md
-[22] https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/language/simd.py#L1247-L1251
-[23] https://gitcode.com/cann/asc-devkit/blob/9.1.0/docs/en/api/SIMD-API/basic_api/reg_vector_compute/type_conversion/Cast-45.md#constraints
-[24] https://arxiv.org/abs/2605.09825
-[25] https://github.com/PTO-ISA/tilelang-puzzles-ascend/tree/simt_compare/puzzles/torch/quant/answer
-[26] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/common.py#L270-L282
-[27] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/per_token_cast_asc.py#L59-L70
-[28] https://github.com/tile-ai/tilelang-puzzles
-[29] https://github.com/PTO-ISA/PTO-Gym/blob/main/docs/PTO-vmi-Instruction-SPEC.md#ptovmivcmax--ptovmivcmin
-[30] https://github.com/PTO-ISA/PTO-Gym/blob/main/docs/PTO-micro-Instruction-SPEC.md
-[31] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/cast_back_cuda.py#L78-L79
-[32] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/cast_back_asc.py#L123-L128
-[33] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/common.py#L285-L294
-[34] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/per_channel_cast_asc.py#L222
-[35] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/per_token_cast_asc.py#L96-L113
-[36] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/per_token_cast_asc.py#L79-L93
-[37] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/per_block_cast_cuda.py#L77-L83
-[38] https://docs.nvidia.com/cuda/cuda-math-api/cuda_math_api/struct____nv__fp4__e2m1.html
-[39] https://github.com/PTO-ISA/tilelang-puzzles-ascend/blob/simt_compare/puzzles/simt/quant/answer/per_token/04_fp32_in_fp4_out.py
-[40] https://gitcode.com/Ascend/msopprof/blob/master/docs/en/user_guide/msopprof_simulator_user_guide.md
-[41] https://github.com/PTO-ISA/tilelang-puzzles-ascend/blob/simt_compare/perf/quant_vf_cycles.json
-[42] https://github.com/hw-native-sys/PTOAS/releases/tag/vmi-v0.1.9
-[43] https://zhuanlan.zhihu.com/p/2044533166694732929
-[44] https://wp.doc.ic.ac.uk/spo/
+[2] https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/README.md
+[3] https://github.com/deepseek-ai/TileKernels/tree/v2.1.0-release/tile_kernels/
+[4] https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/language/simd.py
+[5] https://www.hiascend.com/document/detail/zh/canncommercial/latest/programug/Ascendcopdevg/atlas_ascendc_10_10052.html
+[6] https://github.com/PTO-ISA/PTO-Gym/blob/main/docs/PTO-vmi-Instruction-SPEC.md
+[7] https://github.com/tile-ai/tilelang/blob/main/src/ascend/codegen/codegen_pto.cc
+[8] https://github.com/tile-ai/tilelang/blob/424792eba01d887805fda8f71c847aa7749e6643/src/ascend/codegen/codegen_pto.h#L22
+[9] https://github.com/hw-native-sys/PTOAS/blob/v0.68/ptodsl/docs/user_guide/14-vmi-virtual-instruction-set.md
+[10] https://github.com/tile-ai/tilelang/pull/3512
+[11] https://github.com/huawei-csl/pto-dsl
+[12] https://github.com/hw-native-sys/PTOAS
+[13] https://github.com/deepseek-ai/TileKernels/tree/v2.1.0-release/tile_kernels/quant
+[14] https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/README.md#benchmark
+[15] https://newsletter.semianalysis.com/i/218361806/from-fast-kernels-to-reusable-kernel-engineering
+[16] https://gitcode.com/cann/asc-devkit/blob/v9.1.1/docs/api/SIMD-API/%E5%9F%BA%E7%A1%80API/Reg%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/MaskReg%E8%AE%A1%E7%AE%97/Interleave-11.md
+[17] https://gitcode.com/cann/asc-devkit/blob/v9.1.1/docs/api/SIMD-API/%E5%9F%BA%E7%A1%80API/Reg%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/MaskReg%E8%AE%A1%E7%AE%97/DeInterleave-12.md
+[18] https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/language/simd.py#L1247-L1251
+[19] https://gitcode.com/cann/asc-devkit/blob/9.1.0/docs/en/api/SIMD-API/basic_api/reg_vector_compute/type_conversion/Cast-45.md#constraints
+[20] https://arxiv.org/abs/2605.09825
+[21] https://github.com/PTO-ISA/tilelang-puzzles-ascend/tree/simt_compare/puzzles/torch/quant/answer
+[22] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/common.py#L270-L282
+[23] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/per_token_cast_asc.py#L59-L70
+[24] https://github.com/PTO-ISA/tilelang-puzzles-ascend/tree/simt_compare
+[25] https://github.com/tile-ai/tilelang-puzzles
+[26] https://github.com/PTO-ISA/PTO-Gym/blob/main/docs/PTO-vmi-Instruction-SPEC.md#ptovmivcmax--ptovmivcmin
+[27] https://github.com/PTO-ISA/PTO-Gym/blob/main/docs/PTO-micro-Instruction-SPEC.md
+[28] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/cast_back_cuda.py#L78-L79
+[29] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/cast_back_asc.py#L123-L128
+[30] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/common.py#L285-L294
+[31] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/per_channel_cast_asc.py#L222
+[32] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/per_token_cast_asc.py#L96-L113
+[33] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/per_token_cast_asc.py#L79-L93
+[34] https://github.com/deepseek-ai/TileKernels/blob/v2.1.0-release/tile_kernels/quant/per_block_cast_cuda.py#L77-L83
+[35] https://docs.nvidia.com/cuda/cuda-math-api/cuda_math_api/struct____nv__fp4__e2m1.html
+[36] https://github.com/PTO-ISA/tilelang-puzzles-ascend/blob/simt_compare/puzzles/simt/quant/answer/per_token/04_fp32_in_fp4_out.py
+[37] https://gitcode.com/Ascend/msopprof/blob/master/docs/en/user_guide/msopprof_simulator_user_guide.md
+[38] https://github.com/PTO-ISA/tilelang-puzzles-ascend/blob/simt_compare/perf/quant_vf_cycles.json
+[39] https://github.com/hw-native-sys/PTOAS/releases/tag/vmi-v0.1.9
+[40] https://zhuanlan.zhihu.com/p/2044533166694732929
+[41] https://wp.doc.ic.ac.uk/spo/
 ```
