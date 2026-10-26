@@ -16,7 +16,7 @@
 
 但NPU算子依然看着比CUDA复杂。根据DS开源的TileKernels样例<sup>[3]</sup>，每一个`*_asc.py`算子比相应的`*_cuda.py`冗长**约两倍**。这里不是手搓software pipelining的锅了 (已经被`T.Pipelined`, `T.Persistent`, `T.Stage`等隐藏起来)，而是由于`with T.SimdVF():`内大量使用底层SIMD指令，例如`vld`, `vsts`, `vadds`, `vdup`等等 (见`tilelang.ascend.language.simd`<sup>[4]</sup>）。GPU代码则是`T.Parallel` scope内的标量粒度操作，看着更简单。本文放下SIMD vs SIMT之争的主观偏见，基于具体算法pattern，客观分析语法gap到底在哪。
 
-<img src="fig/hybrid_simt_simd.png" alt="hybrid_simt_simd" width="50%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/hybrid_simt_simd.png?raw=true" alt="hybrid_simt_simd" width="50%" />
 
 Ascend 950支持了SIMD与SIMT混合编程<sup>[5]</sup>，由上图所示。我们可以把同一个算子用SIMD和SIMT各写一遍，逐行对比。SIMT模式的编程体验和早期CUDA接近，只是性能差于SIMD（后文有实测；这里不像优化CUDA那样做好coalesce就能持平SIMD/warp，而是指令吞吐就不同），且指令种类有缺失 (e.g. FP4转换在SIMT模式没有，只在SIMD有)。在SIMD模式下，得进一步区分是"**SIMD本身**难写" (宽泛的结论) 还是"**ASC/CCE的SIMD抽象**太底层所以难写" (更谨慎的结论，说明SIMD概念模型还能抢救)
 
@@ -47,7 +47,7 @@ Ascend 950支持了SIMD与SIMT混合编程<sup>[5]</sup>，由上图所示。我
 
 原因一：国庆开源的TileKernels昇腾适配里，quant算子占很大比例<sup>[13]</sup>。这些都是真实场景有用的算子，有足够的复杂度，例如FP8 cast考虑了输出的内存排布和DeepGEMM对齐，无缝对接。性能也好，大shape性能可以打到950DT roofline的80%左右（见benchmark<sup>[14]</sup>），对950PR已经远远超标了（即HBM bound，不是vector bound）。在Semianalysis的性能实测里<sup>[15]</sup>，tilelang的quantize算子数倍快于Triton-ascend, dequant算子数倍快于CANN包内置算子。
 
-![semi_950_kernel_quant](fig/semi_950_kernel_quant.png)
+![semi_950_kernel_quant](https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/semi_950_kernel_quant.png?raw=true)
 
 原因二：同类的quant算子，在ops-nn仓的AscendC的写法十分酸爽，语法有很大改良空间：
 - MXFP量化，一个核心文件1600行，还没算上其他变种模板 https://gitcode.com/cann/ops-nn/blob/master/quant/dynamic_mx_quant/op_kernel/arch35/dynamic_mx_quant_tail_axis.h
@@ -57,12 +57,12 @@ Ascend 950支持了SIMD与SIMT混合编程<sup>[5]</sup>，由上图所示。我
 
 Ascend 950量化逃不开的运算是 `Reg::Interleave`<sup>[16]</sup> (`S.vintlv`) 和 `Reg::Deinterleave`<sup>[17]</sup> (`S.vdintlv`)，以及相关的`Reg::LoadDist::DIST_DINTLV_B32` (`S.vld2(..., dist="DINTLV_B32"`) 等等。这是由于一个SIMD寄存器长度永远是256 Byte，无论类型(FP32/FP16/BF16/FP8)，所以type cast前后会导致寄存器**数量**的变化，而不是**长度**的变化。这就是为什么`T.vcvt`参数<sup>[18]</sup>会有`PART_EVEN`/`PART_ODD`，甚至`PART_P0`/`PART_P1`/`PART_P2`/`PART_P3`。AscendC `Reg::Cast`文档<sup>[19]</sup>有示意图：
 
-<img src="fig/cast_parts.png" alt="cast_parts" width="70%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/cast_parts.png?raw=true" alt="cast_parts" width="70%" />
 
 为了处理这些奇偶交错的parts，需要时不时用`vintlv`/`vdintlv`转换成其他SIMD计算/store等指令更prefer的layout。如下图示意：
 
-<img src="fig/asc_interleave.png" alt="asc_interleave" width="50%" />
-<img src="fig/asc_deinterleave.png" alt="asc_deinterleave" width="50%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/asc_interleave.png?raw=true" alt="asc_interleave" width="50%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/asc_deinterleave.png?raw=true" alt="asc_deinterleave" width="50%" />
 
 `pto.vmi`一个核心简化是把`vcvt`的行为变成reg长度的变化，(虚拟)寄存器数量依然是一个，使得程序员的mental model更像torch `.to(dtype)`或者numpy`.astype`。是否足够简单？用具体例子展开。
 
@@ -74,9 +74,9 @@ Ascend 950量化逃不开的运算是 `Reg::Interleave`<sup>[16]</sup> (`S.vintl
 
 考虑常用的groupwise量化算子 (排除mixed precision、预排序、旋转、vector quantization等花活儿)，还能调整的无非是：每个scaling factor管多少个数 (按行/按列/按行列，block多大)，scaling factor用什么精度格式 (E8M0, FP32, etc.)。 直观示意 `TileKernels/quant`里的`per_token_cast`, `per_channel_cast`, `per_block_cast`三种情况：
 
-<img src="fig/quant_dim_compare_fig.png" alt="quant algo compare fig" width="50%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/quant_dim_compare_fig.png?raw=true" alt="quant algo compare fig" width="50%" />
 
-<img src="fig/quant_dim_compare_txt.png" alt="quant algo compare text" width="70%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/quant_dim_compare_txt.png?raw=true" alt="quant algo compare text" width="70%" />
 
 （截图自论文 Pretraining large language models with MXFP4 on Native FP4 Hardware<sup>[20]</sup>）
 
@@ -177,7 +177,7 @@ $$
 
 $s$ 已知，怎么算 ${\left\lceil \log_2 s \right\rceil}$ 呢？先考虑更简单的`floor-log2`: ${\left\lfloor \log_2 s \right\rfloor}$ ，用 `bits >> 23 - 127` 就能算出来。FP32的bit是`S1E8M23`, `bits >> 23`把8位指数挪到了最右边。因为是absmax, sign bit一定是0，就只剩`E8`的部分。
 
-<img src="fig/fp32_format.png" alt="FP32 format" width="50%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/fp32_format.png?raw=true" alt="FP32 format" width="50%" />
 
 注意float32的`E8`存的是*biased exponent*，代表的实数是 $s = 1.M \times 2^{E - 127}$ ，所以`log2(s) = (E − 127) + log2(1.m)`，要把`E8`减掉`127`才是 ${\left\lfloor \log_2 s \right\rfloor}$ 。
 
@@ -240,7 +240,7 @@ DS开源的TileKernels把上面提到的很多变种放进了一个kernel文件�
 
 先high-level地统计下 `SimdVF`和`SimtVF`区域的代码行数，粗略近似编程复杂度：
 
-<img src="fig/vf_lines.png" alt="VF lines" width="100%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/vf_lines.png?raw=true" alt="VF lines" width="100%" />
 
 对于“SIMD友好类算子”，比如`per_token_cast`类多是“内存连续的32个数做reduce"，PTO SIMD代码几乎和SIMT一样短，已经足够简单；ASC的冗长是因为物理指令太底层，而非"广义SIMD概念"的锅。而“访存跳跃类”算子，例如“transpose to column major”，SIMT的行数确实更短。总的来说，涉及到transpose、gather、2D/3D broadcast and reduce、irregular strides、算法侧interleave等等灵活访存的pattern，SIMT代码确实更简短、易理解。原则上，SIMD抽象可以跳出1D局限，可以进一步增加high-dimensional reduce/broadcast/gather/scatter等 torch/numpy-like高阶API，但毕竟扩大了API surface，多出一堆函数让用户去记/让agent去查。（API也不是越多越好。。我相信算法哥第一次看到`torch.gather`/`torch.scatter`的高维语义都得楞个几秒钟，如果搞出更复杂的API也不好卖。。）
 
@@ -637,7 +637,7 @@ with T.SimdVF():
 
 相同算法，相同shape，SIMT的cycle数多1.2 ~ 10倍不等。注意这只是VF仿真的结果，不代表真实硬件上的性能差距。如果VF耗时很短，算子是memory bound，那么cycle数多点少点都不会影响实测耗时。
 
-<img src="fig/simt_cycles.png" alt="FP32 format" width="60%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/simt_cycles.png?raw=true" alt="FP32 format" width="60%" />
 
 - 第一行90倍是由于SIMT bit操作硬算FP4，属于特殊outlier。
 - SIMT相对SIMD慢3倍以上的case，例如`per_channel` & `per_block` ，通常也是SIMT语法明显比SIMD简单的case。SIMD要挑选合适的 broadcast, interleave, gather指令，而SIMT捣鼓两行下标就完事。
@@ -645,7 +645,7 @@ with T.SimdVF():
 
 同样用SIMD，对比PTO vs ASC。这里基于`vmi-v0.1.9` PTOAS版本<sup>[39]</sup>，后续版本可能有更多优化。
 
-<img src="fig/pto_cycles.png" alt="FP32 format" width="60%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/pto_cycles.png?raw=true" alt="FP32 format" width="60%" />
 
 Again，VF快30%不代表上板快30%。很多情况ASC基线已经优化到memory-bound了，再省VF时间也看不出效果。
 
@@ -655,11 +655,11 @@ MXFP8->BF16反量化为例，profiling图：
 
 手写ASC/CCE, VF耗时 144 us
 
-<img src="fig/asc_vf_prof.png" alt="asc_vf_prof" width="100%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/asc_vf_prof.png?raw=true" alt="asc_vf_prof" width="100%" />
 
 通过PTO.VMI lower, VF耗时 113 us
 
-<img src="fig/pto_vf_prof.png" alt="pto_vf_prof" width="100%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/pto_vf_prof.png?raw=true" alt="pto_vf_prof" width="100%" />
 
 统计发现`VADD`都是16个，`VMUL`都是32个，而`VINTLV`在ASC用了20个，在PTO只有8个，Pipeline bubble更少
 
@@ -682,7 +682,7 @@ MXFP8->BF16反量化为例，profiling图：
 
 相比于 `T.Parallel` + 标量下标的SIMT式语法，对NPU编译器更轻松的肯定是*扩展high-level SIMD API surface*：添加一堆类似torch/numpy的高维reshape/transpose/reduce/broadcast/gather/scatter等等，不需要lifting只需要lowering。借用Paul Kelly老爷子的一张图<sup>[41]</sup>，下山可比上山容易多了：
 
-<img src="fig/Helicopter.png" alt="Helicopter" width="40%" />
+<img src="https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/fig/Helicopter.png?raw=true" alt="Helicopter" width="40%" />
 
 其实Triton的`tl.max(axis=...)`, `tl.reshape`，`tl.broadcast`已满足"高维tile API"的要求。可惜原生Triton的`tl.load(pointers)`过于不亲和NPU的memory hierarchy和DMA参数。Tilelang的`T.copy`和多层次的`T.alloc_xxx`更贴合NPU；唯独`T.Parallel`语法，在GPU上是个很好的设计 (能利用hardware-based coalescing不用白不用啊)，到SIMD NPU则成了跨硬件兼容的挑战。。
 
