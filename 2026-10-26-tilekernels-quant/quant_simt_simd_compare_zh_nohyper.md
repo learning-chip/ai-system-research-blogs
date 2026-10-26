@@ -1,7 +1,5 @@
 # SIMT比SIMD更好编程？基于TileKernels/quant算子的深入对比分析
 
-带超链接的原版见<sup>[1]</sup>
-
 本文正文**纯手敲，无AI生成**。AI agent仅用于示例代码仓，可复现本文结果：
 - CA model仿真单核算子VF，没有NPU卡的同学也可以跑，带Dockerfile一键复现： https://github.com/PTO-ISA/tilelang-puzzles-ascend/tree/simt_compare
 - 完整多核流水+上板：https://github.com/PTO-ISA/TileKernels-PTO
@@ -9,6 +7,8 @@
 参考自DeepSeek官方样例：
 - https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/README.md
 - https://github.com/deepseek-ai/TileKernels/tree/v2.1.0-release/tile_kernels/quant
+
+带超链接的GitHub版blog见 <sup>[1]</sup>
 
 # 写作动机
 
@@ -690,7 +690,7 @@ MXFP8->BF16反量化为例，profiling图：
 # 引用链接
 
 ```
-[1] quant_simt_simd_compare_zh.md
+[1] https://github.com/learning-chip/ai-system-research-blogs/blob/main/2026-10-26-tilekernels-quant/quant_simt_simd_compare_zh.md
 [2] https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/README.md
 [3] https://github.com/deepseek-ai/TileKernels/tree/v2.1.0-release/tile_kernels/
 [4] https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/language/simd.py
